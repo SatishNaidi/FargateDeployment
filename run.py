@@ -1,10 +1,10 @@
+import os
 import logging
 import boto3
 import pprint
 import csv
 from datetime import datetime, date
 import json
-import os
 import sys
 from time import sleep
 from botocore.exceptions import ClientError
@@ -18,12 +18,13 @@ try:
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
+    log_level = "DEBUG"
     log_level = os.environ['log_level']
     if log_level in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
         level_obj = logging.getLevelName(log_level)
 except KeyError:
     logger.warning("log_level Environment Variable Doesn't exist")
-    log_level = "WARNING"
+    log_level = "DEBUG"
     level_obj = logging.getLevelName(log_level)
 logger.debug('Log Level Set to : DEBUG')
 logger.setLevel(level_obj)
@@ -97,16 +98,18 @@ def format_nested_keys(input_dict):
     return _flatten_json(input_dict)
 
 
-def gather_ec2_instance_info(ec2_client):
-    logger.debug('Started')
-    pages = ec2_client.get_paginator('describe_instances')
+def gather_ec2_instance_info(next_token):
     all_instances_info = []
-    for page in pages.paginate():
-        for reservation in page.get("Reservations"):
-            for instance in reservation.get("Instances"):
-                all_instances_info.append(instance)
-    logger.info(f'Count of Instances : {len(all_instances_info)}')
-    return all_instances_info
+    ec2_client = boto3.client('ec2', region_name="us-east-1")
+    logger.debug("{}: EC2 Client Connection Object Created".format(ec2_client))
+    response = ec2_client.describe_instances(MaxResults=30, NextToken=next_token)
+    next_token = response.get("NextToken")
+    logger.debug(f"NextToken: {next_token}")
+    for reservation in response.get("Reservations"):
+        for instance in reservation.get("Instances"):
+            all_instances_info.append(instance)
+    logger.debug(f" Len of current Instances : {len(all_instances_info)}")
+    return all_instances_info, next_token
 
 
 def divide_chunks(items_list, n):
@@ -137,43 +140,43 @@ def gather_instance_patch_info(ssm_client):
     return all_instances
 
 
-def detailed_instance_patch_report(ssm_client, instance_ids):
-    logger.debug("Started")
-    master_patch_report = []
-    for each_instance in instance_ids:
-        states = ["Installed", "Missing", "Failed"]
-        for each_state in states:
-            success = False
-            retries = 1
-            max_retries = 20
-            all_instances_patch_report = []
-            logger.debug(f"Running for state: {each_state} Instance: {each_instance}")
-            while not success and retries < max_retries:
-                logger.debug(f"Current Retry: {retries}")
-                try:
-                    all_instances_patch_report = []
-                    paginator = ssm_client.get_paginator('describe_instance_patches')
-                    page_iterator = paginator.paginate(InstanceId=each_instance, Filters=[{'Key': 'State',
-                                                                                           'Values': [each_state]}])
-                    items = []
-                    for each_page in page_iterator:
-                        logger.debug(each_page.get("Patches", []))
-                        items.extend(each_page.get("Patches", []))
-                    items = [dict(item, InstanceId=each_instance) for item in items]
-                    instance_patch_report = json.loads(json.dumps(items, default=json_serial))
-                    all_instances_patch_report.extend(instance_patch_report)
-                    success = True
-                except ClientError as cl_err:
-                    wait = retries * 5
-                    logger.warning(f'Error: {cl_err} Waiting {wait} secs and re-trying...')
-                    sys.stdout.flush()
-                    sleep(wait)
-                    retries += 1
-                except Exception as outErr:
-                    logger.warning(outErr)
-            master_patch_report.extend(all_instances_patch_report)
-    logger.info(f"Len master_patch_report: {len(master_patch_report)}")
-    return master_patch_report
+def detailed_instance_patch_report(instance_id, state, next_token=''):
+    ssm_client = boto3.client('ssm', region_name="us-east-1")
+    logger.debug(f"Running for state: {instance_id}, Instance: {state}")
+    try:
+        instance_patch_report = []
+        # paginator = ssm_client.get_paginator('describe_instance_patches')
+
+        if next_token == '':
+            result = ssm_client.describe_instance_patches(
+                InstanceId=instance_id,
+                Filters=[{'Key': 'State', 'Values': [state]}],
+                MaxResults=40
+            )
+        else:
+            result = ssm_client.describe_instance_patches(
+                InstanceId=instance_id,
+                Filters=[{'Key': 'State', 'Values': [state]}],
+                NextToken=next_token,
+                MaxResults=40
+            )
+        items = []
+        next_token = result.get("NextToken")
+        items.extend(result.get("Patches", []))
+        items = json.loads(json.dumps(items, default=json_serial))
+        for item in items:
+            item["InstanceId"] = instance_id
+
+        # instance_patch_report = [dict(item, InstanceId=instance_id) for item in items]
+        instance_patch_report = json.loads(json.dumps(items, default=json_serial))
+    except ClientError as cl_err:
+        next_token = None
+        logger.warning(f'Error: {cl_err}')
+    except Exception as outErr:
+        next_token = None
+        logger.warning(outErr)
+    logger.info(f"Len master_patch_report: {len(instance_patch_report)}")
+    return instance_patch_report, next_token
 
 
 def filter_needed_fields(input_dict, filter_keys):
@@ -196,9 +199,13 @@ def write_to_csv(filename, list_of_dict):
     :return:
     """
     # Making sure to write to /tmp dir if running on AWS Lambda other wise to current dir
-    # if __name__ != "__main__":
-    #     filename = "/tmp/" + filename
-    filename = "/tmp/" + filename
+    # if __name__ == "__main__":
+    if sys.platform.startswith("win"):
+        if not os.path.exists("tmp/"):
+            os.mkdir("tmp")
+        filename = "tmp/" + filename
+    else:
+        filename = "/tmp/" + filename
     logger.info("Writing CSV File : {} ".format(filename))
 
     json_serialized = json.loads(json.dumps(list_of_dict, default=json_serial))
@@ -230,9 +237,15 @@ def convert_csv_to_excel(out_file_name, csv_list):
     """
     Converts all given CSV List of files to EXCEL
     """
-    # if __name__ != "__main__":
-    #     out_file_name = "/tmp/" + out_file_name
-    out_file_name = "/tmp/" + out_file_name
+
+    # if __name__ == "__main__":
+    if sys.platform.startswith("win"):
+        if not os.path.exists("tmp/"):
+            os.mkdir("tmp")
+        out_file_name = "tmp/" + out_file_name
+    else:
+        out_file_name = "/tmp/" + out_file_name
+
     logger.info(f"Excel File: {out_file_name}")
     try:
         workbook = Workbook(out_file_name)
@@ -334,7 +347,7 @@ def lambda_handler(event, context):
         bucket_name = os.environ['bucket_name']
     except KeyError:
         logger.warning("Env Variable 'bucket_name' doesn't exits")
-        bucket_name = 'reports-ssm'
+        bucket_name = "2ftv-ssm-logs-42212-s3"
     logger.info("Bucket for writing logs bucket_name = {}".format(bucket_name))
 
     # PatchBaselines Report
@@ -343,7 +356,14 @@ def lambda_handler(event, context):
     csvs_list.append(write_to_csv("PatchBaseLineReport.csv", list_of_patches))
     # EC2Report
     field_names = ['InstanceId', 'State', 'IamInstanceProfile', 'Tags', 'LaunchTime']
-    ec2_info = gather_ec2_instance_info(ec2_client)
+    # ec2_info = gather_ec2_instance_info()
+    next_token = ''
+    ec2_info = []
+    while next_token is not None:
+        result_instances, next_token = gather_ec2_instance_info(next_token)
+        ec2_info.extend(result_instances)
+
+    logger.debug(f"Total EC2 Instances Count : {len(ec2_info)}")
     required_info = filter_needed_fields(ec2_info, field_names)
     required_info_instance_ids = {item["InstanceId"]: item for item in required_info}
 
@@ -356,13 +376,25 @@ def lambda_handler(event, context):
     instance_patch_info = {each_item["InstanceId"]: each_item for each_item in instance_patch_info}
 
     # Detailed Instance Patch Report
-    instance_patch_report = detailed_instance_patch_report(ssm_client, required_info_instance_ids)
-    for each_instance in instance_patch_report:
+    # instance_patch_report = detailed_instance_patch_report(ssm_client, required_info_instance_ids)
+
+    all_instance_patch_report = []
+    try:
+        for each_instance in required_info_instance_ids.keys():
+            for each_state in ["Installed", "Missing", "Failed"]:
+                next_token = ''
+                while next_token is not None:
+                    result_set, next_token = detailed_instance_patch_report(each_instance, each_state, next_token)
+                    all_instance_patch_report.extend(result_set)
+    except Exception as err:
+        print(err)
+
+    for each_instance in all_instance_patch_report:
         if each_instance["InstanceId"] in required_info_instance_ids:
             each_instance["Name"] = required_info_instance_ids[each_instance["InstanceId"]].get("Name", "NA")
             each_instance["RunState"] = required_info_instance_ids[each_instance["InstanceId"]]["State"]
 
-    csvs_list.append(write_to_csv("EC2PatchReport.csv", instance_patch_report))
+    csvs_list.append(write_to_csv("EC2PatchReport.csv", all_instance_patch_report))
 
     # Consolidating EC2 Report, Patch State Report and Instance Patch Info
     for each_ec2 in required_info:
